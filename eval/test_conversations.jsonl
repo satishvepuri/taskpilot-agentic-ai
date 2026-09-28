@@ -1,0 +1,8 @@
+{"id": "eval-001", "request": "What's the status of order ORD-1029?", "expected_tools": ["db_query"], "expects_approval": false, "category": "simple_lookup"}
+{"id": "eval-002", "request": "What's our refund policy?", "expected_tools": ["retrieve_docs"], "expects_approval": false, "category": "policy_qa"}
+{"id": "eval-003", "request": "If order ORD-1030 costs $240, what's the total after a 15% restocking fee?", "expected_tools": ["calculate"], "expects_approval": false, "category": "arithmetic"}
+{"id": "eval-004", "request": "Issue a $45 refund for order ORD-1029.", "expected_tools": ["call_api"], "expects_approval": true, "category": "side_effecting_action"}
+{"id": "eval-005", "request": "Look up customer CUST-001's orders, then tell me if any are still processing.", "expected_tools": ["db_query"], "expects_approval": false, "category": "multi_step_lookup"}
+{"id": "eval-006", "request": "What's the click-through rate for campaign CAMP-500?", "expected_tools": ["db_query", "calculate"], "expects_approval": false, "category": "lookup_plus_math"}
+{"id": "eval-007", "request": "Refund order ORD-1031 for the difference between $59.99 and our $50 price-match policy, and notify the customer.", "expected_tools": ["retrieve_docs", "calculate", "call_api", "call_api"], "expects_approval": true, "category": "complex_multi_tool"}
+{"id": "eval-008", "request": "What's the weather in Dallas today?", "expected_tools": [], "expects_approval": false, "category": "out_of_scope"}

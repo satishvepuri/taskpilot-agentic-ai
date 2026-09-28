@@ -1,0 +1,27 @@
+# Secret keys
+.env
+.env.*
+*.key
+
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Generated RAG index
+data/index/
+
+# Evaluation results
+eval/*_results.jsonl
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Operating system files
+.DS_Store
+Thumbs.db
