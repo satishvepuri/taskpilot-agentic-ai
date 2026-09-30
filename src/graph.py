@@ -1,16 +1,5 @@
 """
-The TaskPilot agent graph, built with LangGraph.
-
-Flow:
-  planner -> tool_executor -> (loop until plan complete or approval needed)
-          -> if a step needs approval: save state and stop cleanly (no
-             infinite polling loop) — a later `python main.py --approve`
-             call resumes it via resume_agent()
-          -> responder (synthesizes final answer once all steps are done)
-
-Each node is a plain function over AgentState -> partial AgentState update,
-which is the LangGraph pattern. Structured outputs (Plan, ToolResult) keep
-node boundaries typed and testable in isolation from the LLM.
+TaskPilot LangGraph orchestration.
 """
 from typing import Literal
 
@@ -38,37 +27,48 @@ Given a user request and conversation history, decompose it into an ordered
 list of subtasks. Each subtask must use exactly one tool:
 
 - db_query: structured lookups against orders/customers/campaigns
-  (templates: get_order_status, get_customer_orders, get_customer_profile, get_campaign_metrics)
 - retrieve_docs: answer questions about policies/FAQs from the knowledge base
-- calculate: any arithmetic (fees, totals, percentages)
-- call_api: actions with real-world side effects (issue_refund, update_campaign_budget, send_notification)
-- respond: use only as the final step once no more tool calls are needed
+- calculate: arithmetic
+- call_api: real-world side effects
+- respond: final response once no more tool calls are needed
 
-Mark requires_approval=true for any call_api subtask, since these have
-real side effects and must be human-approved before executing.
+DETERMINISTIC PLANNING POLICY:
+1. Order status/customer/campaign metrics: db_query, then respond.
+2. Refund/shipping policy questions: retrieve_docs, then respond.
+3. Pure arithmetic: calculate, then respond.
+4. Refund action: db_query get_order_status, then call_api issue_refund, then respond.
+5. Campaign budget update: db_query get_campaign_metrics, then call_api update_campaign_budget, then respond.
+6. Notification action: call_api send_notification, then respond. Do NOT add db_query unless the user explicitly asks for a lookup.
+7. Lookup plus arithmetic: db_query, then calculate, then respond.
+8. Do not add extra tools.
 
-IMPORTANT — tool_input format: for db_query and call_api, tool_input MUST
-be written EXACTLY as "template_name(param=value)", using parentheses and
-an equals sign — for example: "get_order_status(order_id=ORD-1029)".
-Do NOT use a colon or a space instead of parentheses (e.g. do NOT write
-"get_order_status: ORD-1029").
+Mark requires_approval=true for every call_api subtask.
+All non-call_api subtasks must have requires_approval=false.
 
-Respond ONLY with valid JSON matching this schema:
+For db_query and call_api, tool_input MUST use:
+template_name(param=value)
+
+Respond ONLY with valid JSON matching:
 {"reasoning": str, "subtasks": [{"step_id": int, "description": str, "tool": str, "tool_input": str, "requires_approval": bool}]}
 """
-
 
 def planner_node(state: AgentState) -> dict:
     history = memory.get_history(state["conversation_id"])
     messages = to_langchain_messages(history, PLANNER_SYSTEM_PROMPT, state["user_request"])
 
-    # Structured output keeps planning machine-readable. For OpenAI this
-    # explicitly uses function/tool calling; Claude uses its native tool-use
-    # structured-output path through LangChain.
-    planner = build_structured_model(Plan)
-    plan = planner.invoke(messages)
-    if not isinstance(plan, Plan):
-        plan = Plan.model_validate(plan)
+    last_error = None
+    plan = None
+    for _ in range(3):
+        try:
+            planner = build_structured_model(Plan)
+            candidate = planner.invoke(messages)
+            plan = candidate if isinstance(candidate, Plan) else Plan.model_validate(candidate)
+            break
+        except Exception as exc:
+            last_error = exc
+
+    if plan is None:
+        raise last_error
 
     memory.append_turn(state["conversation_id"], "user", state["user_request"])
 
@@ -79,14 +79,13 @@ def planner_node(state: AgentState) -> dict:
         "status": "executing",
     }
 
-
 def tool_executor_node(state: AgentState) -> dict:
     plan = Plan.model_validate(state["plan"])
     idx = state["current_step_index"]
     subtask = plan.subtasks[idx]
 
     if subtask.tool == ToolName.RESPOND:
-        return {"status": "executing"}  # handled by router -> responder
+        return {"status": "executing"}
 
     if subtask.requires_approval:
         approval.request_approval(state["conversation_id"], subtask.model_dump())
@@ -99,35 +98,41 @@ def tool_executor_node(state: AgentState) -> dict:
     success, output, error, attempts = run_with_retry(fn, subtask.tool_input)
 
     result = ToolResult(
-        step_id=subtask.step_id, tool=subtask.tool, success=success,
-        output=output, error=error, attempts=attempts,
+        step_id=subtask.step_id,
+        tool=subtask.tool,
+        success=success,
+        output=output,
+        error=error,
+        attempts=attempts,
     )
 
-    updated_results = state.get("tool_results", []) + [result.model_dump()]
     return {
-        "tool_results": updated_results,
+        "tool_results": state.get("tool_results", []) + [result.model_dump()],
         "current_step_index": idx + 1,
         "status": "executing",
     }
 
-
 def _execute_approved_subtask(subtask: dict, decision: dict) -> ToolResult:
-    """Shared logic for running (or recording rejection of) a subtask once
-    a human has made a decision on it. Used both by the initial run (if a
-    decision somehow already exists) and by resume_agent (the normal path)."""
     if not decision["approved"]:
         return ToolResult(
-            step_id=subtask["step_id"], tool=subtask["tool"], success=False,
-            output=None, error=(f"Rejected by human reviewer: {decision.get('reason')}"
-                   if decision.get("reason") else "Rejected by human reviewer"), attempts=0,
+            step_id=subtask["step_id"],
+            tool=subtask["tool"],
+            success=False,
+            output=None,
+            error=f"Rejected by human reviewer: {decision.get('reason')}" if decision.get("reason") else "Rejected by human reviewer",
+            attempts=0,
         )
+
     fn = TOOL_DISPATCH[ToolName(subtask["tool"])]
     success, output, error, attempts = run_with_retry(fn, subtask["tool_input"])
     return ToolResult(
-        step_id=subtask["step_id"], tool=subtask["tool"], success=success,
-        output=output, error=error, attempts=attempts,
+        step_id=subtask["step_id"],
+        tool=subtask["tool"],
+        success=success,
+        output=output,
+        error=error,
+        attempts=attempts,
     )
-
 
 def responder_node(state: AgentState) -> dict:
     plan = Plan.model_validate(state["plan"])
@@ -144,28 +149,22 @@ def responder_node(state: AgentState) -> dict:
     responder = build_chat_model("responder")
     response = responder.invoke([
         SystemMessage(content=(
-            "Synthesize a clear, concise answer to the user's original request "
-            "using only the tool execution results below. If any step failed, "
-            "acknowledge it plainly. Do not invent policy rules or facts that "
-            "are not present in the tool results."
+            "Synthesize a clear, concise answer using only the tool execution results. "
+            "Preserve important numbers and action statuses. Do not invent facts."
         )),
         HumanMessage(content=(
             f"Original request: {state['user_request']}\n\n"
             f"Plan reasoning: {plan.reasoning}\n\n"
-            f"Tool results:\n" + "\n".join(summary_lines)
+            "Tool results:\n" + "\n".join(summary_lines)
         )),
     ])
+
     final_text = message_text(response)
     memory.append_turn(state["conversation_id"], "assistant", final_text)
-
     return {"final_response": final_text, "status": "done"}
-
 
 def route_after_executor(state: AgentState) -> Literal["tool_executor", "responder", "end"]:
     if state["status"] == "awaiting_approval":
-        # Stop the graph run cleanly here rather than looping — a separate
-        # process (triggered by `python main.py --approve ...`) will resume
-        # from the saved paused state once a human has made a decision.
         return "end"
 
     plan = Plan.model_validate(state["plan"])
@@ -174,33 +173,26 @@ def route_after_executor(state: AgentState) -> Literal["tool_executor", "respond
     if idx >= len(plan.subtasks):
         return "responder"
 
-    next_tool = plan.subtasks[idx].tool
-    if next_tool == ToolName.RESPOND:
+    if plan.subtasks[idx].tool == ToolName.RESPOND:
         return "responder"
 
     return "tool_executor"
 
-
 def build_graph():
     graph = StateGraph(AgentState)
-
     graph.add_node("planner", planner_node)
     graph.add_node("tool_executor", tool_executor_node)
     graph.add_node("responder", responder_node)
 
     graph.set_entry_point("planner")
     graph.add_edge("planner", "tool_executor")
-
-    graph.add_conditional_edges("tool_executor", route_after_executor, {
-        "tool_executor": "tool_executor",
-        "responder": "responder",
-        "end": END,
-    })
-
+    graph.add_conditional_edges(
+        "tool_executor",
+        route_after_executor,
+        {"tool_executor": "tool_executor", "responder": "responder", "end": END},
+    )
     graph.add_edge("responder", END)
-
     return graph.compile()
-
 
 def run_agent(conversation_id: str, user_request: str) -> AgentState:
     app = build_graph()
@@ -209,7 +201,7 @@ def run_agent(conversation_id: str, user_request: str) -> AgentState:
         "user_request": user_request,
         "status": "planning",
     }
-    # recursion_limit guards against a pathological plan looping forever
+
     final_state = app.invoke(initial_state, config={"recursion_limit": 25})
 
     if final_state["status"] == "awaiting_approval":
@@ -217,27 +209,14 @@ def run_agent(conversation_id: str, user_request: str) -> AgentState:
 
     return final_state
 
-
 def resume_agent(conversation_id: str) -> AgentState:
-    """
-    Continues a paused workflow after a human has approved or rejected the
-    pending step. This runs the remaining subtasks directly (not through
-    graph.invoke) since LangGraph's entry point is fixed to `planner` —
-    resuming mid-plan means replaying the loop ourselves using the exact
-    same node functions the graph itself uses, so behavior stays identical.
-    """
     state = approval.load_paused_state(conversation_id)
     if state is None:
-        raise ValueError(
-            f"No paused workflow found for conversation '{conversation_id}'. "
-            "It may have already been resumed, or expired."
-        )
+        raise ValueError(f"No paused workflow found for conversation '{conversation_id}'.")
 
     subtask = state["pending_approval"]
     decision = approval.poll_approval(conversation_id, subtask["step_id"])
     if decision is None:
-        # Not approved/rejected yet — nothing to do. Caller (main.py) should
-        # tell the user to run --approve or --reject first.
         return state
 
     result = _execute_approved_subtask(subtask, decision)
@@ -250,8 +229,6 @@ def resume_agent(conversation_id: str) -> AgentState:
     }
     approval.clear_paused_state(conversation_id)
 
-    # Continue running any remaining steps, which may include hitting
-    # another approval-required step (handled the same way).
     while True:
         plan = Plan.model_validate(state["plan"])
         idx = state["current_step_index"]

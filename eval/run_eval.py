@@ -41,12 +41,18 @@ def exact_tool_sequence(planned: list[str], expected: list[str]) -> float:
     return 1.0 if planned == expected else 0.0
 
 
+def _normalize_text(value) -> str:
+    text = str(value or "").lower()
+    text = text.replace("$", "").replace(",", "")
+    text = " ".join(text.split())
+    return text
+
+
 def response_quality(response: str, expected_tokens: list[str]) -> float:
-    """Simple auditable score: fraction of expected tokens present in response."""
     if not expected_tokens:
         return 1.0 if response and response.strip() else 0.0
-    text = (response or "").lower()
-    hits = sum(1 for token in expected_tokens if str(token).lower() in text)
+    text = _normalize_text(response)
+    hits = sum(1 for token in expected_tokens if _normalize_text(token) in text)
     return hits / len(expected_tokens)
 
 
